@@ -6,5 +6,7 @@ jei_sidebar.favorites = Favorites
 jei_sidebar.hide_fav = Hide Favorites
 jei_sidebar.show_fav = Show Favorites
 jei_sidebar.star = *
+jei_sidebar.hide_icon = ✕
+jei_sidebar.show_icon = o
 jei_sidebar.done = Done
 hud.element.jei_sidebar.jei_sidebar_favorites = Favorites
