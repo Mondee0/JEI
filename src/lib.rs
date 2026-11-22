@@ -58,18 +58,29 @@ fn normalize(s: &str) -> String {
 }
 
 fn filtered_items(search: &str) -> Vec<u32> {
-    let needle = normalize(search);
-    let needle = needle.trim();
+    let search = search.trim();
+    // Try to compile as a regex; fall back to literal substring match.
+    let re = if search.is_empty() {
+        None
+    } else {
+        regex_lite::Regex::new(search).ok()
+    };
+    let literal = search.to_lowercase();
     let mut out: Vec<u32> = (1..entry_count(abi::entry_kind::ITEM))
         .filter(|&id| {
             let name = item_name(id);
             if name.is_empty() {
                 return false;
             }
-            if needle.is_empty() {
+            if search.is_empty() {
                 return true;
             }
-            normalize(name).contains(needle)
+            let norm = normalize(name);
+            if let Some(re) = &re {
+                re.is_match(&norm) || re.is_match(name)
+            } else {
+                norm.contains(&literal) || name.to_lowercase().contains(&literal)
+            }
         })
         .collect();
     out.sort_by_key(|&id| item_name(id));
