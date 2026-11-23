@@ -5,8 +5,10 @@
 
 use weft_sdk::*;
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 declare_mod!(deps: ["base"], init: init);
 
@@ -22,6 +24,11 @@ const WIDE_PANEL_W: f32 = GRID_W * 2.0 + GAP + PAD * 2.0;
 
 static DUMMY: Menu = Menu::named("jei_sidebar_rebuild");
 static FAV_TOGGLE_ELEMENT: HudElement = HudElement::named("jei_sidebar_fav_toggle");
+static CRAFTING_KIND: RecipeKind = RecipeKind::named("base:crafting");
+static CRAFTING_MENU: Menu = Menu::named("base:crafting_table");
+static INVENTORY_MENU: Menu = Menu::named("base:inventory");
+static QUICK_CRAFT: Channel<Vec<u8>> = Channel::named("quick_craft");
+static PENDING_CRAFT: Mutex<Vec<(u64, Instant, QuickCraft)>> = Mutex::new(Vec::new());
 
 static FAV_REVISION: AtomicUsize = AtomicUsize::new(0);
 static TOGGLE_REVISION: AtomicUsize = AtomicUsize::new(0);
@@ -162,6 +169,413 @@ fn corner_button_click(c: &Client, screen: &str) {
     }
 }
 
+// ---------------------------------------------------------------- quick craft
+// The plus button in the recipe viewer sends a recipe's raw pattern/keys/inputs to the server.
+// The server resolves concrete items from the player's inventory, checks the grid with the
+// engine's own matcher, then moves the ingredients into the open crafting grid.
+
+#[derive(Clone)]
+struct QuickCraft {
+    shapeless: bool,
+    pattern: Vec<String>,
+    keys: Vec<(char, String)>,
+    inputs: Vec<String>,
+    amounts: Vec<u32>,
+    output: ItemStack,
+}
+
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn str(&mut self, s: &str) {
+        self.u32(s.len() as u32);
+        self.0.extend_from_slice(s.as_bytes());
+    }
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn u8(&mut self) -> Option<u8> {
+        let v = *self.bytes.get(self.at)?;
+        self.at += 1;
+        Some(v)
+    }
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.bytes.get(self.at..self.at + 4)?;
+        self.at += 4;
+        Some(u32::from_le_bytes(b.try_into().ok()?))
+    }
+    fn str(&mut self) -> Option<String> {
+        let n = self.u32()? as usize;
+        if n > 1 << 20 {
+            return None;
+        }
+        let b = self.bytes.get(self.at..self.at + n)?;
+        self.at += n;
+        String::from_utf8(b.to_vec()).ok()
+    }
+}
+
+impl QuickCraft {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.u8(1);
+        w.u8(self.shapeless as u8);
+        w.u32(self.pattern.len() as u32);
+        for row in &self.pattern {
+            w.str(row);
+        }
+        w.u32(self.keys.len() as u32);
+        for (c, reference) in &self.keys {
+            w.u8(*c as u8);
+            w.str(reference);
+        }
+        w.u32(self.inputs.len() as u32);
+        for reference in &self.inputs {
+            w.str(reference);
+        }
+        w.u32(self.amounts.len() as u32);
+        for n in &self.amounts {
+            w.u32(*n);
+        }
+        w.u32(self.output.item);
+        w.u32(self.output.count);
+        w.u32(self.output.data);
+        w.0
+    }
+
+    fn decode(bytes: &[u8]) -> Option<QuickCraft> {
+        let mut r = Reader { bytes, at: 0 };
+        if r.u8()? != 1 {
+            return None;
+        }
+        let shapeless = r.u8()? != 0;
+        let n = r.u32()? as usize;
+        if n > 16 {
+            return None;
+        }
+        let mut pattern = Vec::new();
+        for _ in 0..n {
+            pattern.push(r.str()?);
+        }
+        let n = r.u32()? as usize;
+        if n > 256 {
+            return None;
+        }
+        let mut keys = Vec::new();
+        for _ in 0..n {
+            let c = r.u8()? as char;
+            keys.push((c, r.str()?));
+        }
+        let n = r.u32()? as usize;
+        if n > 256 {
+            return None;
+        }
+        let mut inputs = Vec::new();
+        for _ in 0..n {
+            inputs.push(r.str()?);
+        }
+        let n = r.u32()? as usize;
+        if n > 256 {
+            return None;
+        }
+        let mut amounts = Vec::new();
+        for _ in 0..n {
+            amounts.push(r.u32()?);
+        }
+        let output = ItemStack { item: r.u32()?, count: r.u32()?, data: r.u32()? };
+        (r.at == bytes.len() && !output.is_empty()).then_some(QuickCraft { shapeless, pattern, keys, inputs, amounts, output })
+    }
+}
+
+/// Whether `item` has the tag `tag`; `{m}` matches any material part (oak, iron...).
+fn tag_matches(tag: &str, item: u32) -> bool {
+    let components = components_of(abi::entry_kind::ITEM, item);
+    match tag.split_once('{') {
+        None => components.iter().any(|(name, schema)| schema.is_empty() && *name == tag),
+        Some((prefix, rest)) => {
+            let suffix = rest.split_once('}').map_or("", |(_, s)| s);
+            components.iter().any(|(name, schema)| {
+                schema.is_empty()
+                    && name.len() > prefix.len() + suffix.len()
+                    && name.starts_with(prefix)
+                    && name.ends_with(suffix)
+            })
+        }
+    }
+}
+
+fn item_matches_ref(item: u32, reference: &str) -> bool {
+    if let Some(tag) = reference.strip_prefix('#') {
+        return tag_matches(tag, item);
+    }
+    let name = item_name(item);
+    name == reference || name.rsplit_once(':').is_some_and(|(_, path)| path == reference)
+}
+
+/// The reference with `{m}` filled from the result's own tags, so a stairs recipe picks the
+/// stairs of the wood the result is made of instead of any wood.
+fn concrete_refs(reference: &str, output: ItemStack) -> Vec<String> {
+    let Some((prefix, rest)) = reference.strip_prefix('#').and_then(|r| r.split_once('{')) else {
+        return vec![reference.to_string()];
+    };
+    let suffix = rest.split_once('}').map_or("", |(_, s)| s);
+    let mut out = Vec::new();
+    for (name, schema) in components_of(abi::entry_kind::ITEM, output.item) {
+        if schema.is_empty()
+            && name.len() > prefix.len() + suffix.len()
+            && name.starts_with(prefix)
+            && name.ends_with(suffix)
+        {
+            out.push(format!("#{}{}{}", prefix, &name[prefix.len()..name.len() - suffix.len()], suffix));
+        }
+    }
+    out
+}
+
+struct Requirement {
+    cells: Vec<(usize, u32)>,
+    reference: String,
+    need: u32,
+}
+
+/// One requirement per distinct ingredient, with the grid cells and counts it fills.
+fn requirements(craft: &QuickCraft, cols: u32, rows: u32) -> Option<Vec<Requirement>> {
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let cells = (cols * rows) as usize;
+    let mut out: Vec<Requirement> = Vec::new();
+    if craft.shapeless {
+        if craft.inputs.is_empty() || craft.inputs.len() > cells {
+            return None;
+        }
+        for (i, reference) in craft.inputs.iter().enumerate() {
+            let amount = craft.amounts.get(i).copied().unwrap_or(1).max(1);
+            match out.iter_mut().find(|r| r.reference == *reference) {
+                Some(r) => {
+                    r.cells.push((i, amount));
+                    r.need += amount;
+                }
+                None => out.push(Requirement { cells: vec![(i, amount)], reference: reference.clone(), need: amount }),
+            }
+        }
+    } else {
+        if craft.pattern.is_empty() || craft.pattern.len() > rows as usize {
+            return None;
+        }
+        for (y, row) in craft.pattern.iter().enumerate() {
+            for (x, c) in row.chars().enumerate() {
+                if x >= cols as usize {
+                    return None;
+                }
+                if c == ' ' {
+                    continue;
+                }
+                let reference = craft.keys.iter().find(|(key, _)| *key == c).map(|(_, r)| r.clone())?;
+                let slot = y * cols as usize + x;
+                match out.iter_mut().find(|r| r.reference == reference) {
+                    Some(r) => {
+                        r.cells.push((slot, 1));
+                        r.need += 1;
+                    }
+                    None => out.push(Requirement { cells: vec![(slot, 1)], reference, need: 1 }),
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn candidate_items(reference: &str, output: ItemStack, slots: &[(u8, u32, ItemStack)]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let concrete = concrete_refs(reference, output);
+    for (_, _, stack) in slots {
+        if !out.contains(&stack.item) && concrete.iter().any(|r| item_matches_ref(stack.item, r)) {
+            out.push(stack.item);
+        }
+    }
+    if out.is_empty() {
+        for (_, _, stack) in slots {
+            if !out.contains(&stack.item) && item_matches_ref(stack.item, reference) {
+                out.push(stack.item);
+            }
+        }
+    }
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for (_, _, stack) in slots {
+        *counts.entry(stack.item).or_default() += stack.count;
+    }
+    out.sort_by_key(|item| std::cmp::Reverse(counts.get(item).copied().unwrap_or(0)));
+    out.truncate(24);
+    out
+}
+
+fn build_grid(reqs: &[Requirement], chosen: &[Option<u32>], cols: u32, rows: u32) -> Vec<ItemStack> {
+    let mut grid = vec![ItemStack::EMPTY; (cols * rows) as usize];
+    for (req, item) in reqs.iter().zip(chosen) {
+        let Some(item) = *item else { return Vec::new() };
+        for &(slot, count) in &req.cells {
+            if slot >= grid.len() {
+                return Vec::new();
+            }
+            grid[slot] = ItemStack { item, count, data: 0 };
+        }
+    }
+    grid
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve(
+    reqs: &[Requirement],
+    candidates: &[Vec<u32>],
+    chosen: &mut Vec<Option<u32>>,
+    remaining: &mut HashMap<u32, u32>,
+    index: usize,
+    craft: &QuickCraft,
+    cols: u32,
+    rows: u32,
+    attempts: &mut u32,
+) -> Option<Vec<ItemStack>> {
+    if index == reqs.len() {
+        *attempts += 1;
+        if *attempts > 4000 {
+            return None;
+        }
+        let grid = build_grid(reqs, chosen, cols, rows);
+        if grid.is_empty() {
+            return None;
+        }
+        let made = recipe_grid_output(&CRAFTING_KIND, &grid, cols, rows);
+        return (made.item == craft.output.item && made.count == craft.output.count && made.data == craft.output.data)
+            .then_some(grid);
+    }
+    let need = reqs[index].need;
+    for &item in &candidates[index] {
+        let have = remaining.get(&item).copied().unwrap_or(0);
+        if have < need {
+            continue;
+        }
+        *remaining.get_mut(&item).unwrap() -= need;
+        chosen[index] = Some(item);
+        if let Some(grid) = solve(reqs, candidates, chosen, remaining, index + 1, craft, cols, rows, attempts) {
+            return Some(grid);
+        }
+        chosen[index] = None;
+        *remaining.get_mut(&item).unwrap() += need;
+    }
+    None
+}
+
+fn fill_craft(ctx: &MenuCtx, craft: &QuickCraft) -> bool {
+    let Some(grid_group) = ctx.find_group("grid") else { return false };
+    let (cols, rows) = (grid_group.cols(), grid_group.rows());
+    if cols == 0 || rows == 0 {
+        return false;
+    }
+    if (0..grid_group.len()).any(|i| !grid_group.get(i).is_empty()) {
+        return false;
+    }
+    let Some(reqs) = requirements(craft, cols, rows) else { return false };
+
+    let mut slots: Vec<(u8, u32, ItemStack)> = Vec::new();
+    for (group, name) in [INVENTORY_GROUP, HOTBAR_GROUP].into_iter().enumerate() {
+        if let Some(g) = ctx.find_group(name) {
+            for i in 0..g.len() {
+                let stack = g.get(i);
+                if !stack.is_empty() {
+                    slots.push((group as u8, i, stack));
+                }
+            }
+        }
+    }
+    let mut remaining: HashMap<u32, u32> = HashMap::new();
+    for (_, _, stack) in &slots {
+        *remaining.entry(stack.item).or_default() += stack.count;
+    }
+    let candidates: Vec<Vec<u32>> = reqs.iter().map(|r| candidate_items(&r.reference, craft.output, &slots)).collect();
+    if candidates.iter().any(|c| c.is_empty()) {
+        return false;
+    }
+    let mut chosen = vec![None; reqs.len()];
+    let mut attempts = 0;
+    let Some(grid) = solve(&reqs, &candidates, &mut chosen, &mut remaining, 0, craft, cols, rows, &mut attempts) else {
+        return false;
+    };
+
+    // Work out what to take before changing anything.
+    let mut need: HashMap<u32, u32> = HashMap::new();
+    for (req, item) in reqs.iter().zip(&chosen) {
+        if let Some(item) = item {
+            *need.entry(*item).or_default() += req.need;
+        }
+    }
+    let mut plan: Vec<(u8, u32, ItemStack)> = Vec::new();
+    for (group, i, stack) in &slots {
+        let Some(left) = need.get_mut(&stack.item) else { continue };
+        if *left == 0 {
+            continue;
+        }
+        let take = (*left).min(stack.count);
+        *left -= take;
+        if take == 0 {
+            continue;
+        }
+        let rest = stack.count - take;
+        plan.push((*group, *i, if rest == 0 { ItemStack::EMPTY } else { ItemStack { count: rest, ..*stack } }));
+    }
+    if need.values().any(|&n| n != 0) {
+        return false;
+    }
+    for (group, i, stack) in plan {
+        if let Some(g) = ctx.find_group([INVENTORY_GROUP, HOTBAR_GROUP][group as usize]) {
+            g.set(i, stack);
+        }
+    }
+    for (i, stack) in grid.iter().enumerate() {
+        if !stack.is_empty() {
+            grid_group.set(i as u32, *stack);
+        }
+    }
+    if let Some(result) = ctx.find_group("result") {
+        result.set(0, craft.output);
+    }
+    true
+}
+
+fn quick_craft_tick(ctx: &MenuCtx) {
+    let player = ctx.player();
+    let craft = {
+        let mut pending = PENDING_CRAFT.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|(p, at, _)| *p != player || at.elapsed().as_secs_f32() < 2.0);
+        pending.iter().find(|(p, _, _)| *p == player).map(|(_, _, c)| c.clone())
+    };
+    let Some(craft) = craft else { return };
+    {
+        let mut pending = PENDING_CRAFT.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|(p, _, _)| *p != player);
+    }
+    fill_craft(ctx, &craft);
+}
+
+fn open_grid(menu: Option<abi::OpenMenu>) -> (u32, u32) {
+    match menu {
+        Some(m) if m.kind == CRAFTING_MENU.id() => (3, 3),
+        Some(m) if m.kind == INVENTORY_MENU.id() => (2, 2),
+        _ => (0, 0),
+    }
+}
+
 fn normalize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -202,7 +616,7 @@ fn filtered_items(search: &str) -> Vec<u32> {
 
 fn make_item_button(ui: &mut Ui, id: u32) {
     ui.button_content(
-        S::default().class("slot").size(SLOT, SLOT).pad(1.0),
+        S::default().class("tab").size(SLOT, SLOT).pad(1.0),
         id,
         move |c, item_id| {
             let mut st = state();
@@ -235,6 +649,71 @@ fn make_item_button(ui: &mut Ui, id: u32) {
 
 fn init(r: &mut Registry) {
     r.menu(&DUMMY).screen(|_| {});
+
+    // The recipe viewer's display for crafting: the usual inputs, arrow and outputs, plus a
+    // button that moves the ingredients from the player's inventory into the open grid.
+    r.edit(&CRAFTING_KIND).layout(|ui, recipe| {
+        let entry = recipe.entry();
+        let pattern = comps::recipe::PATTERN.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
+        let keys = comps::recipe::KEYS.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
+        let inputs = comps::recipe::INPUTS.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
+        let amounts = comps::recipe::AMOUNTS.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
+        let output = recipe.outputs().first().map(|(stack, _)| *stack).unwrap_or(ItemStack::EMPTY);
+        let shapeless = pattern.is_empty();
+        let (cols, rows) = open_grid(ui.view().client().menu());
+        let fits = cols > 0
+            && !output.is_empty()
+            && if shapeless {
+                !inputs.is_empty() && inputs.len() <= (cols * rows) as usize
+            } else {
+                !pattern.is_empty()
+                    && pattern.len() <= rows as usize
+                    && pattern.iter().all(|row| row.chars().count() <= cols as usize)
+            };
+        let craft = QuickCraft {
+            shapeless,
+            pattern,
+            keys: keys.iter().map(|key| (key.name.chars().next().unwrap_or(' '), key.item.clone())).collect(),
+            inputs,
+            amounts,
+            output,
+        };
+        let shapeless = craft.shapeless;
+        let input_count = craft.inputs.len();
+        ui.column(S::column().gap(2.0), |ui| {
+            ui.row(S::row().gap(6.0), |ui| {
+                ui.recipe_inputs();
+                ui.row(S::row().gap(1.0).center(), |ui| {
+                    ui.recipe_arrow();
+                    if shapeless && input_count > 1 {
+                        ui.image("core:gui/icon_shapeless", 9.0, 9.0);
+                    }
+                });
+                ui.recipe_outputs();
+                let send = craft.clone();
+                ui.button(
+                    "jei_sidebar.plus",
+                    S::default().size(18.0, 18.0).pad(0.0).disabled(!fits).tooltip("jei_sidebar.quick_craft"),
+                    move |c| {
+                        if open_grid(c.client().menu()).0 != 0 {
+                            c.client().send(&QUICK_CRAFT, &send.encode());
+                            c.client().menu_close();
+                        }
+                    },
+                );
+            });
+        });
+    });
+
+    r.packet(&QUICK_CRAFT, |p, bytes| {
+        if let Some(craft) = QuickCraft::decode(&bytes) {
+            let mut pending = PENDING_CRAFT.lock().unwrap_or_else(|e| e.into_inner());
+            pending.retain(|(_, at, _)| at.elapsed().as_secs_f32() < 2.0);
+            pending.push((p.player(), Instant::now(), craft));
+        }
+    });
+    r.edit(&CRAFTING_MENU).on_tick(quick_craft_tick);
+    r.edit(&INVENTORY_MENU).on_tick(quick_craft_tick);
 
     // Bottom-right HUD toggle button for favorites visibility
     r.hud_element(&FAV_TOGGLE_ELEMENT, hud_anchor::BOTTOM_RIGHT, 0, |ui| {
@@ -326,7 +805,7 @@ fn init(r: &mut Registry) {
                                 match items.get(idx) {
                                     Some(&id) => make_item_button(ui, id),
                                     None => {
-                                        ui.panel("slot", S::default().size(SLOT, SLOT), |_| {});
+                                        ui.column(S::default().size(SLOT, SLOT), |_| {});
                                     }
                                 }
                             }
@@ -389,7 +868,7 @@ fn init(r: &mut Registry) {
                                     match favorites.get(idx) {
                                         Some(&id) => make_item_button(ui, id),
                                         None => {
-                                            ui.panel("slot", S::default().size(SLOT, SLOT), |_| {});
+                                            ui.column(S::default().size(SLOT, SLOT), |_| {});
                                         }
                                     }
                                 }

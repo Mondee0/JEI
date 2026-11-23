@@ -9,4 +9,6 @@ jei_sidebar.star = *
 jei_sidebar.hide_icon = ✕
 jei_sidebar.show_icon = o
 jei_sidebar.done = Done
+jei_sidebar.plus = +
+jei_sidebar.quick_craft = Quick craft
 hud.element.jei_sidebar.jei_sidebar_favorites = Favorites
