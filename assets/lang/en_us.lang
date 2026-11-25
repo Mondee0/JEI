@@ -1,4 +1,5 @@
 mod.jei_sidebar.name = Jei Sidebar
+mod.jei_sidebar.authors = Cloud
 jei_sidebar.prev = <
 jei_sidebar.next = >
 jei_sidebar.page = {0}/{1}
