@@ -1,5 +1,6 @@
 mod.jei_sidebar.name = Jei Sidebar
 mod.jei_sidebar.authors = Cloud
+mod.jei_sidebar.url = https://github.com/Mondee0/JEI
 jei_sidebar.prev = <
 jei_sidebar.next = >
 jei_sidebar.page = {0}/{1}
