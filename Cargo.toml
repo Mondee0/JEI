@@ -1,6 +1,6 @@
 [package]
 name = "jei_sidebar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "JEI-style item search grid, favorites and quick-craft for Weft."
 
