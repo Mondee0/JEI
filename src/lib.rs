@@ -174,6 +174,20 @@ fn corner_button_click(c: &Client, screen: &str) {
 // The server resolves concrete items from the player's inventory, checks the grid with the
 // engine's own matcher, then moves the ingredients into the open crafting grid.
 
+/// The recipe entry id, read from the host. `RecipeView` keeps its kind and index private, so
+/// mirror its two fields (a `String` then a `u32`) to ask `recipe_info` for the entry.
+fn recipe_entry(recipe: &RecipeView) -> u32 {
+    #[repr(C)]
+    struct Mirror {
+        kind: String,
+        index: u32,
+    }
+    let mirror: &Mirror = unsafe { std::mem::transmute(recipe) };
+    let mut info = abi::RecipeInfo::default();
+    let ok = unsafe { (host().recipe_info)(abi::Str::new(&mirror.kind), mirror.index, &mut info) } != 0;
+    if ok { info.entry } else { u32::MAX }
+}
+
 #[derive(Clone)]
 struct QuickCraft {
     shapeless: bool,
@@ -653,7 +667,7 @@ fn init(r: &mut Registry) {
     // The recipe viewer's display for crafting: the usual inputs, arrow and outputs, plus a
     // button that moves the ingredients from the player's inventory into the open grid.
     r.edit(&CRAFTING_KIND).layout(|ui, recipe| {
-        let entry = recipe.entry();
+        let entry = recipe_entry(recipe);
         let pattern = comps::recipe::PATTERN.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
         let keys = comps::recipe::KEYS.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();
         let inputs = comps::recipe::INPUTS.on(abi::entry_kind::RECIPE, entry).unwrap_or_default();

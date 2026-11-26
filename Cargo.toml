@@ -1,15 +1,12 @@
 [package]
 name = "jei_sidebar"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+description = "JEI-style item search grid, favorites and quick-craft for Weft."
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-weft_sdk.workspace = true
+weft_sdk = { git = "https://github.com/Weft-Rust/Weft", tag = "v26.11.7" }
 regex-lite = "0.1"
-
-[package.metadata.weft]
-dist = false
