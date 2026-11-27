@@ -579,7 +579,7 @@ fn quick_craft_tick(ctx: &MenuCtx) {
         let mut pending = PENDING_CRAFT.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|(p, _, _)| *p != player);
     }
-    fill_craft(ctx, &craft);
+    let ok = fill_craft(ctx, &craft);
 }
 
 fn open_grid(menu: Option<abi::OpenMenu>) -> (u32, u32) {
